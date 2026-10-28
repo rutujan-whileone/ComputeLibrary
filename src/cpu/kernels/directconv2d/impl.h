@@ -37,6 +37,9 @@
 
 #include <algorithm>
 
+#include <cstring>
+#include <cstdint>
+
 namespace arm_compute
 {
 namespace cpu
@@ -145,6 +148,55 @@ void linearize_volume_nchw(const uint8_t *const in_ptr,
     }
 }
 
+// Tiny-copy helpers for linearize_volume_nhwc.
+// Layers with very few input channels (e.g. 1 channel, as in the first conv of KWS / DS-CNN) copy 1..4 bytes at a
+// time. Calling libc memcpy/memset for that costs far more than the copy itself, so the common small sizes are
+// handled with fixed-size (inlined) moves and anything else falls back to libc.
+inline void copy_small_bytes(void *dst, const void *src, size_t n)
+{
+    switch (n)
+    {
+        case 1:
+            std::memcpy(dst, src, 1);
+            break;
+        case 2:
+            std::memcpy(dst, src, 2);
+            break;
+        case 3:
+            std::memcpy(dst, src, 3);
+            break;
+        case 4:
+            std::memcpy(dst, src, 4);
+            break;
+        case 8:
+            std::memcpy(dst, src, 8);
+            break;
+        default:
+            std::memcpy(dst, src, n);
+            break;
+    }
+}
+
+inline void fill_small_bytes(void *dst, int value, size_t n)
+{
+    const uint8_t b = static_cast<uint8_t>(value);
+    switch (n)
+    {
+        case 1:
+            *static_cast<uint8_t *>(dst) = b;
+            break;
+        case 4:
+        {
+            const uint32_t w = 0x01010101U * b;
+            std::memcpy(dst, &w, 4);
+            break;
+        }
+        default:
+            std::memset(dst, value, n);
+            break;
+    }
+}
+
 template <typename T, bool has_pads>
 void linearize_volume_nhwc(const uint8_t *const in_ptr,
                            T                   *out_ptr,
@@ -172,8 +224,8 @@ void linearize_volume_nhwc(const uint8_t *const in_ptr,
         for (int y = start_y; y < end_y; y += dilation_y)
         {
             //optimized for no dilation and no boundary pixels
-            memcpy(out_ptr, reinterpret_cast<const T *>(in_ptr + (y * input_stride_z + start_x * input_stride_y)),
-                   input_c * kernel_width * element_size);
+            copy_small_bytes(out_ptr, in_ptr + (y * input_stride_z + start_x * input_stride_y),
+                             input_c * kernel_width * element_size);
             out_ptr += input_c * kernel_width;
         }
     }
@@ -183,7 +235,7 @@ void linearize_volume_nhwc(const uint8_t *const in_ptr,
         {
             if (y < 0 || y >= input_h)
             {
-                memset(static_cast<void *>(out_ptr), pad_value, pad_quant * element_size);
+                fill_small_bytes(out_ptr, pad_value, pad_quant * element_size);
                 out_ptr += pad_quant;
             }
             else if (dilation_x > 1 || start_x < 0 || end_x >= input_w || input_stride_y != input_c * element_size)
@@ -192,13 +244,13 @@ void linearize_volume_nhwc(const uint8_t *const in_ptr,
                 {
                     if (x < 0 || x >= input_w)
                     {
-                        memset(static_cast<void *>(out_ptr), pad_value, input_c * element_size);
+                        fill_small_bytes(out_ptr, pad_value, input_c * element_size);
                         out_ptr += input_c;
                     }
                     else
                     {
-                        memcpy(out_ptr, reinterpret_cast<const T *>(in_ptr + (y * input_stride_z + x * input_stride_y)),
-                               input_c * element_size);
+                        copy_small_bytes(out_ptr, in_ptr + (y * input_stride_z + x * input_stride_y),
+                                         input_c * element_size);
                         out_ptr += input_c;
                     }
                 }
@@ -206,8 +258,8 @@ void linearize_volume_nhwc(const uint8_t *const in_ptr,
             else
             {
                 //optimized for no dilation and no boundary pixels
-                memcpy(out_ptr, reinterpret_cast<const T *>(in_ptr + (y * input_stride_z + start_x * input_stride_y)),
-                       input_c * kernel_width * element_size);
+                copy_small_bytes(out_ptr, in_ptr + (y * input_stride_z + start_x * input_stride_y),
+                                 input_c * kernel_width * element_size);
                 out_ptr += input_c * kernel_width;
             }
         }
